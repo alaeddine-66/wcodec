@@ -61,7 +61,7 @@ void arena_print_usage(Arena *a) {
 
     while (b) {
         total_used += b->used;
-	printf("block %d usage : %zu\n", nb_blocks, b->used);
+        printf("block %d usage : %zu\n", nb_blocks, b->used);
         total_cap  += b->cap;
         nb_blocks++;
         b = b->next;
