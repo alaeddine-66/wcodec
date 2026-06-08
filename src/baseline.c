@@ -1,6 +1,8 @@
 #include "../include/allocator.h"
 #include "../include/header.h"
 #include "../include/tokenizer.h"
+#include "../include/hashmap.h"
+#include <stdlib.h>
 
 int encode(char *file_name)
 {
@@ -18,9 +20,28 @@ int encode(char *file_name)
          arena_free(&arena);
          return 0;
     }
-    tokenizer_dump(&t);
+    //tokenizer_dump(&t);
+
+    uint32_t *tokens = NULL;
+    size_t n = 0;
+
+    if (!tokenizer_encode(&t, "hello world", &tokens, &n, 1)) {
+        fprintf(stderr, "encode failed\n");
+        return 0;
+    }
+
+
+
+    for (size_t i = 0; i < n; i++) {
+        printf("%u ", tokens[i]);
+    }
+    printf("\n");
+    free(tokens);
 
     arena_print_usage(&arena);
     arena_free(&arena);
+    
+    printf("EXIT SUCCESS\n");
+    printf("%zu\n", sizeof(size_t));
     return 1;
 }

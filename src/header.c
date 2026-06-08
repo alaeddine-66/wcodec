@@ -3,6 +3,7 @@
 #include <string.h>
 #include "../include/allocator.h"
 #include "../include/header.h"
+#include "../include/hashmap.h"
 #include <stdbool.h>
 
 int read_string(Arena *arena, gguf_string_t *str, FILE *f)
@@ -234,6 +235,14 @@ int read_tensors(Arena *arena, gguf_tensor_info_t *tensors, uint64_t tensor_coun
     }
 
     return 1;
+}
+
+gguf_tensor_info_t *tensor_lookup(gguf_header_t *h, const char *name) {
+    for (uint64_t i = 0; i < h->tensor_count; i++) {
+        if (strcmp(h->tensors[i].name.string, name) == 0)
+            return &h->tensors[i];
+    }
+    return NULL;
 }
 
 static void find_alignment(uint32_t *alignment, uint64_t kv_count, gguf_metadata_kv_t *metadata_kv)

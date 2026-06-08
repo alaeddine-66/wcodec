@@ -7,17 +7,16 @@
 typedef struct {
     char *key;
     uint32_t value;
-    unsigned char used;
-} StrMapEntry;
+} HashMapEntry;
 
 typedef struct {
-    StrMapEntry *entries;
+    HashMapEntry *entries;
     size_t cap;
     size_t len;
-} StrMap;
+} HashMap_t;
 
-int strmap_init(StrMap *m, Arena *arena, size_t initial_cap);
-int strmap_put(StrMap *m, const char *key_ref, int value);
-int strmap_get(const StrMap *m, const char *key, int *out_value);
+int strmap_init(HashMap_t *m, Arena *arena, size_t initial_cap);
+int strmap_put(HashMap_t *m, const char *key_ref, uint32_t value);
+int strmap_get(const HashMap_t *m, const char *key, uint32_t *out_value);
 
 #endif

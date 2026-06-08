@@ -81,14 +81,14 @@ static char *concat2(const char *a, const char *b) {
 
 /* Look up a token in the vocabulary and return its ID. */
 static int vocab_lookup(const Tokenizer *t, const char *token, uint32_t *out_id) {
-    int v;
+    uint32_t v;
     if (!strmap_get(&t->token_to_id, token, &v)) return 0;
-    if (out_id) *out_id = (uint32_t)v;
+    if (out_id) *out_id = v;
     return 1;
 }
 
 /* Look up the rank of a merge pair: "left right". */
-static int merge_rank_lookup(const Tokenizer *t, const char *left, const char *right, int *out_rank) {
+static int merge_rank_lookup(const Tokenizer *t, const char *left, const char *right, uint32_t *out_rank) {
     char key[512];
     size_t nl = strlen(left);
     size_t nr = strlen(right);
@@ -125,7 +125,7 @@ static int special_cmp_desc_len(const void *a, const void *b) {
  * If is_tokens is true, the function fills token-related structures.
  * Otherwise it fills the merge-rank map.
  */
-static int read_array(Arena *arena, FILE *f, DeferredStringArray ref_array, StrMap *map,
+static int read_array(Arena *arena, FILE *f, DeferredStringArray ref_array, HashMap_t *map,
                 Tokenizer *t, const TokenTypeRLE *rle, bool is_tokens)
 {
     fseek(f, ref_array.file_offset, SEEK_SET);
@@ -264,9 +264,7 @@ static char *xstrdup(const char *s) {
  * then merged greedily using the lowest-ranked available pair.
  */
 static int bpe_encode_piece(const Tokenizer *t, const char *piece, uint32_t **out_ids, size_t *out_n, size_t *out_cap) {
-    *out_ids = NULL;
-    *out_n = 0;
-
+    
     size_t plen = strlen(piece);
     if (plen == 0) return 1;
 
@@ -290,7 +288,7 @@ static int bpe_encode_piece(const Tokenizer *t, const char *piece, uint32_t **ou
         size_t best_i = (size_t)-1;
 
         for (size_t i = 0; i + 1 < n; i++) {
-            int rank;
+            uint32_t rank;
             if (merge_rank_lookup(t, syms[i], syms[i + 1], &rank)) {
                 if (rank < best_rank) {
                     best_rank = rank;
@@ -334,8 +332,9 @@ static int bpe_encode_piece(const Tokenizer *t, const char *piece, uint32_t **ou
                 return 0;
             }
         }
-        (*out_ids)[(*out_n)++] = id;
+        (*out_ids)[*out_n + i] = id;
     }
+    *out_n += n;
 
     for (size_t j = 0; j < n; j++) free(syms[j]);
     free(syms);
@@ -352,40 +351,52 @@ int tokenizer_encode(Tokenizer *t,
                      const char *text,
                      uint32_t **out_tokens,
                      size_t *out_count,
-                     int add_bos) {
+                     int add_bos)
+{
     if (!t || !text || !out_tokens || !out_count) return 0;
 
     *out_tokens = NULL;
     *out_count = 0;
 
     size_t cap = 32;
-    uint32_t *ids = (uint32_t *)malloc(cap * sizeof(uint32_t));
+    uint32_t *ids = (uint32_t *)malloc(cap * sizeof(*ids));
     if (!ids) return 0;
-    size_t n = 0;
 
+    size_t n = 0;
     if (add_bos && t->bos_id != UINT32_MAX) {
         ids[n++] = t->bos_id;
     }
 
-    size_t i = 0;
     size_t text_len = strlen(text);
-    size_t pending_ws_start = (size_t)-1;
-    size_t pending_ws_len = 0;
-
-    char *scratch = malloc(text_len + 1);
+    char *scratch = (char *)malloc(text_len + 1);
     if (!scratch) {
         free(ids);
         return 0;
     }
 
+    size_t i = 0;
+    size_t pending_ws_start = 0;
+    size_t pending_ws_len = 0;
+    int has_pending_ws = 0;
+
     while (i < text_len) {
         uint32_t sp_id = 0;
         size_t sp_len = 0;
 
-        /* Special tokens have priority over normal text. */
         if (match_special_at(t, text + i, &sp_len, &sp_id)) {
-            pending_ws_start = (size_t)-1;
-            pending_ws_len = 0;
+            if (has_pending_ws) {
+                memcpy(scratch, text + pending_ws_start, pending_ws_len);
+                scratch[pending_ws_len] = '\0';
+
+                if (!bpe_encode_piece(t, scratch, &ids, &n, &cap)) {
+                    free(scratch);
+                    free(ids);
+                    return 0;
+                }
+
+                has_pending_ws = 0;
+                pending_ws_len = 0;
+            }
 
             if (!ensure_capacity(&ids, &cap, n + 1)) {
                 free(scratch);
@@ -399,9 +410,13 @@ int tokenizer_encode(Tokenizer *t,
         }
 
         if (is_space_byte((unsigned char)text[i])) {
-            if (pending_ws_start == (size_t)-1) pending_ws_start = i;
-            pending_ws_len++;
-            i++;
+            if (!has_pending_ws) {
+                pending_ws_start = i;
+                has_pending_ws = 1;
+                pending_ws_len = 0;
+            }
+            ++pending_ws_len;
+            ++i;
             continue;
         }
 
@@ -409,29 +424,38 @@ int tokenizer_encode(Tokenizer *t,
         while (i < text_len) {
             uint32_t dummy_id;
             size_t dummy_len;
+
             if (match_special_at(t, text + i, &dummy_len, &dummy_id)) break;
             if (is_space_byte((unsigned char)text[i])) break;
-            i++;
+            ++i;
         }
 
-        /* Rebuild the chunk with its leading whitespace, if any. */
         size_t pos = 0;
-        if (pending_ws_len > 0) {
+        if (has_pending_ws) {
             memcpy(scratch + pos, text + pending_ws_start, pending_ws_len);
             pos += pending_ws_len;
+            has_pending_ws = 0;
+            pending_ws_len = 0;
         }
+
         memcpy(scratch + pos, text + start, i - start);
         pos += i - start;
         scratch[pos] = '\0';
 
-        pending_ws_start = (size_t)-1;
-        pending_ws_len = 0;
-
-        uint32_t *piece_ids = NULL;
-        int ok = bpe_encode_piece(t, scratch, &piece_ids, &n, &cap);
-        if (!ok) {
-            free(ids);
+        if (!bpe_encode_piece(t, scratch, &ids, &n, &cap)) {
             free(scratch);
+            free(ids);
+            return 0;
+        }
+    }
+
+    if (has_pending_ws) {
+        memcpy(scratch, text + pending_ws_start, pending_ws_len);
+        scratch[pending_ws_len] = '\0';
+
+        if (!bpe_encode_piece(t, scratch, &ids, &n, &cap)) {
+            free(scratch);
+            free(ids);
             return 0;
         }
     }
@@ -463,7 +487,7 @@ void tokenizer_dump(const Tokenizer *t) {
     printf("\n--- token_to_id (first 20) ---\n");
     size_t shown = 0;
     for (size_t i = 0; i < t->token_to_id.cap && shown < 20; i++) {
-        if (!t->token_to_id.entries[i].used) continue;
+        if (!t->token_to_id.entries[i].key) continue;
         printf("  %-30s → %d\n",
                t->token_to_id.entries[i].key,
                t->token_to_id.entries[i].value);
@@ -473,7 +497,7 @@ void tokenizer_dump(const Tokenizer *t) {
     printf("\n--- merge_rank (first 20) ---\n");
     shown = 0;
     for (size_t i = 0; i < t->merge_rank.cap && shown < 20; i++) {
-        if (!t->merge_rank.entries[i].used) continue;
+        if (!t->merge_rank.entries[i].key) continue;
         printf("  rank %-6d  %s\n",
                t->merge_rank.entries[i].value,
                t->merge_rank.entries[i].key);

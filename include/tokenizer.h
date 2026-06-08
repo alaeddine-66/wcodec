@@ -14,9 +14,9 @@ typedef struct {
     size_t token_count;
     size_t merge_count;
 
-    StrMap token_to_id;
+    HashMap_t token_to_id;
     char **id_to_token;
-    StrMap merge_rank;
+    HashMap_t merge_rank;
 
     uint32_t bos_id;
     uint32_t eos_id;

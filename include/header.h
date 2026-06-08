@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "allocator.h"
+#include "hashmap.h"
 
 typedef enum{
     GGML_TYPE_F32     = 0,
@@ -190,5 +191,6 @@ typedef struct {
 } gguf_header_t ;
 
 gguf_header_t *read_header(Arena *arena, const char *file_name);
+gguf_tensor_info_t *tensor_lookup(gguf_header_t *h, const char *name);
 
 #endif

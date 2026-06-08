@@ -1,33 +1,65 @@
-.PHONY: all clean debug
+TARGET   = main
+CC       = gcc
+LD       = gcc
+OBJ_DIR  = build
+UNITY_DIR = tests/unity
 
-CC = gcc
-CFLAGS = -Wall -ansi -pedantic -g -std=c99
-LDFLAGS =
+CFLAGS  += -Wall -Wextra -std=c99 -Iinclude -I$(UNITY_DIR) -MMD -MP 
+LDFLAGS  = -lm
 
-EXECUTABLE = main
+URL_BASE    = https://raw.githubusercontent.com/ThrowTheSwitch/Unity/master/src
+UNITY_FILES = $(UNITY_DIR)/unity.c $(UNITY_DIR)/unity.h $(UNITY_DIR)/unity_internals.h
 
-SRC_DIR = src
-OBJ_DIR = obj
+SRC_FILES   = $(wildcard src/*.c)
+OBJ_FILES   = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRC_FILES))
+TEST_OBJS   = $(filter-out $(OBJ_DIR)/main.o, $(OBJ_FILES))
 
-SOURCE = $(wildcard $(SRC_DIR)/*.c)
-OBJETS = $(SOURCE:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
+TEST_SRCS   = $(wildcard tests/test_*.c)
+TEST_BINS   = $(TEST_SRCS:.c=.bin)
+# Correction des dépendances pour inclure les fichiers .d des tests correctement
+DEPS        = $(OBJ_FILES:.o=.d) $(patsubst tests/%.c,$(OBJ_DIR)/%.d,$(TEST_SRCS))
 
-all: $(EXECUTABLE)
+.PHONY: all debug tests clean
 
-debug: CFLAGS += -g
-debug: all
+##@ compilation
+all: CFLAGS  += -g -O2 -fsanitize=address --coverage $(ERR)
+all: LDFLAGS += -g -fsanitize=address --coverage
+all: $(TARGET) $(TEST_BINS) 
 
-$(EXECUTABLE): $(OBJETS)
-	$(CC) $(CFLAGS) $(OBJETS) $(LDFLAGS) -o $(EXECUTABLE)
+debug: CFLAGS  += -g -Og -fsanitize=address 
+debug: LDFLAGS += -g -fsanitize=address 
+debug: clean $(TARGET) $(TEST_BINS) 
 
-# compilation des .c de src vers obj
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -MMD -c $< -o $@
+# Inclusion des dépendances auto
+-include $(DEPS)
 
-$(OBJ_DIR):
-	mkdir -p $(OBJ_DIR)
+# Création des dossiers à la volée
+$(OBJ_DIR) $(UNITY_DIR):
+	mkdir -p $@
 
-clean:
-	rm -rf $(OBJ_DIR) *.d $(EXECUTABLE)
+# Téléchargement de Unity
+$(UNITY_DIR)/%: | $(UNITY_DIR)
+	@curl -Ls $(URL_BASE)/$(notdir $@) -o $@
 
--include $(OBJETS:.o=.d)
+# Compilation de Unity
+$(OBJ_DIR)/unity.o: $(UNITY_FILES) | $(OBJ_DIR)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+# Compilation des sources
+$(OBJ_DIR)/%.o: src/%.c | $(OBJ_DIR)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+# Compilation des objets de test (Correction du chemin du pattern)
+$(OBJ_DIR)/%.o: tests/%.c | $(OBJ_DIR)
+	$(CC) -c $(CFLAGS) $< -o $@
+
+# Édition de liens pour les binaires de test (Correction ici : tests/%.bin)
+tests/%.bin: $(OBJ_DIR)/%.o $(TEST_OBJS) $(OBJ_DIR)/unity.o
+	$(LD) $^ $(LDFLAGS) -o $@
+
+# Édition de liens pour le binaire principal
+$(TARGET): $(OBJ_FILES) 
+	$(LD) $^ $(LDFLAGS) -o $@
+
+clean: 
+	rm -rf $(TARGET) $(OBJ_DIR) tests/*.bin
