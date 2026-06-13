@@ -245,15 +245,13 @@ gguf_tensor_info_t *tensor_lookup(gguf_header_t *h, const char *name) {
     return NULL;
 }
 
-static void find_alignment(uint32_t *alignment, uint64_t kv_count, gguf_metadata_kv_t *metadata_kv)
+gguf_metadata_kv_t *metadata_lookup(gguf_header_t *h, const char *name)
 {
-    for(uint64_t i = 0; i < kv_count; i++){
-        if((strcmp(metadata_kv[i].key.string, "general.alignment") == 0)
-	 && (metadata_kv[i].value_type == GGUF_METADATA_VALUE_TYPE_UINT32)){
-	        *alignment = metadata_kv[i].value.uint32;
-	        return;
-	    }
-    }
+    for(uint64_t i = 0; i < h->metadata_kv_count; i++){
+        if(strcmp(h->metadata_kv[i].key.string, name) == 0)
+	        return &h->metadata_kv[i];
+	}
+    return NULL;
 }
 
 static inline long align_offset(long offset, uint32_t alignment) {
@@ -338,10 +336,12 @@ gguf_header_t *read_header(Arena *arena, const char *file_name){
         return NULL;
     }
 
-    uint32_t alignment = 32;
-    find_alignment(&alignment, kv_count, gguf_reader->metadata_kv);
+    uint32_t align;
+    gguf_metadata_kv_t *alignment_meata = metadata_lookup(gguf_reader, "general.alignment");
+    if (!alignment_meata || alignment_meata->value_type !=  GGUF_METADATA_VALUE_TYPE_UINT32) align = 32;
+    else align = alignment_meata->value.uint32;
     long offset = ftell(f);
-    gguf_reader->tensor_data_offset = align_offset(offset, alignment);
+    gguf_reader->tensor_data_offset = align_offset(offset, align);
 
     fclose(f);
     return gguf_reader;

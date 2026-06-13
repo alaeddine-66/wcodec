@@ -284,7 +284,7 @@ static int bpe_encode_piece(const Tokenizer *t, const char *piece, uint32_t **ou
     }
 
     while (n >= 2) {
-        int best_rank = INT_MAX;
+        uint32_t best_rank = INT_MAX;
         size_t best_i = (size_t)-1;
 
         for (size_t i = 0; i + 1 < n; i++) {
@@ -342,11 +342,6 @@ static int bpe_encode_piece(const Tokenizer *t, const char *piece, uint32_t **ou
     return 1;
 }
 
-/*
- * Encode input text into token IDs.
- * Special tokens are matched first, whitespace is preserved for normal text,
- * and each non-special chunk is encoded with BPE.
- */
 int tokenizer_encode(Tokenizer *t,
                      const char *text,
                      uint32_t **out_tokens,
@@ -464,6 +459,95 @@ int tokenizer_encode(Tokenizer *t,
 
     *out_tokens = ids;
     *out_count = n;
+    return 1;
+}
+
+static void build_unicode_to_bytes(HashMap_t *map) {
+    for (int b = 0; b < 256; b++) {
+        strmap_put(map, bytes_to_unicode_table[b], (uint32_t)b);
+    }
+}
+
+int tokenizer_decode(Tokenizer *t,
+                      Arena *arena,
+                      const uint32_t *tokens,
+                      size_t count,
+                      char **out_text)
+{
+    if (!t || !tokens || !out_text) return 0;
+
+    HashMap_t unicode_to_byte;
+    if (!strmap_init(&unicode_to_byte, arena, 512)) return 0;
+    build_unicode_to_bytes(&unicode_to_byte);
+
+    size_t cap = 256;
+    size_t len = 0;
+    char *out = (char *)malloc(cap);
+    if (!out) return 0;
+
+    for (size_t k = 0; k < count; k++) {
+        uint32_t id = tokens[k];
+
+        if (id >= t->token_count || !t->id_to_token[id]) {
+            free(out);
+            return 0;
+        }
+
+        const char *tok = t->id_to_token[id];
+        size_t tok_len = strlen(tok);
+
+        size_t i = 0;
+        while (i < tok_len) {
+            unsigned char c = (unsigned char)tok[i];
+            size_t cp_len;
+
+            if ((c & 0x80) == 0)      cp_len = 1;
+            else if ((c & 0xE0) == 0xC0) cp_len = 2;
+            else if ((c & 0xF0) == 0xE0) cp_len = 3;
+            else if ((c & 0xF8) == 0xF0) cp_len = 4;
+            else                          cp_len = 1;
+
+            if (i + cp_len > tok_len) cp_len = tok_len - i;
+
+            char cp_buf[TOKENIZER_MAX_UTF8_BYTES];
+            memcpy(cp_buf, tok + i, cp_len);
+            cp_buf[cp_len] = '\0';
+
+            uint32_t byte_val;
+            if (strmap_get(&unicode_to_byte, cp_buf, &byte_val)) {
+                if (len + 1 > cap) {
+                    size_t new_cap = cap * 2;
+                    char *tmp = (char *)realloc(out, new_cap);
+                    if (!tmp) { free(out); return 0; }
+                    out = tmp;
+                    cap = new_cap;
+                }
+                out[len++] = (char)byte_val;
+            } else {
+                if (len + cp_len > cap) {
+                    size_t new_cap = cap;
+                    while (new_cap < len + cp_len) new_cap *= 2;
+                    char *tmp = (char *)realloc(out, new_cap);
+                    if (!tmp) { free(out); return 0; }
+                    out = tmp;
+                    cap = new_cap;
+                }
+                memcpy(out + len, cp_buf, cp_len);
+                len += cp_len;
+            }
+
+            i += cp_len;
+        }
+    }
+
+    if (len + 1 > cap) {
+        char *tmp = (char *)realloc(out, len + 1);
+        if (!tmp) { free(out); return 0; }
+        out = tmp;
+    }
+    out[len] = '\0';
+
+    *out_text = out;
     return 1;
 }
 

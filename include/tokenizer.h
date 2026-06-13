@@ -34,6 +34,13 @@ int tokenizer_encode(Tokenizer *t,
                      uint32_t **out_tokens,
                      size_t *out_count,
                      int add_bos);
+
+int tokenizer_decode(Tokenizer *t,
+                      Arena *arena,
+                      const uint32_t *tokens,
+                      size_t count,
+                      char **out_text);
+
 void tokenizer_dump(const Tokenizer *t);
 
 #endif

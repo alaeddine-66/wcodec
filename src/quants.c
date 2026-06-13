@@ -78,3 +78,45 @@ void dequantize_q6_K(block_q6_K *blocks, float *src, uint32_t nb_blocks )
     }
 }
 
+static inline void get_scale_min_k4(int j, const uint8_t *sc, uint8_t *scale, uint8_t *min)
+{
+    if (j < 4) {
+        *scale = sc[j]     & 0x3F;
+        *min   = sc[j + 4] & 0x3F;
+    } else {
+        *scale = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
+        *min   = (sc[j + 4] >> 4)   | ((sc[j]     >> 6) << 4);
+    }
+}
+
+void dequantize_q4_K(block_q4_K *blocks, float *src, uint32_t nb_blocks)
+{
+    for (uint32_t i = 0; i < nb_blocks; i++) {
+        const block_q4_K *b = &blocks[i];
+        const float d    = fp16_to_fp32(b->GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
+        const float dmin = fp16_to_fp32(b->GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin);
+
+        const uint8_t *q  = b->qs;
+        const uint8_t *sc = b->scales;
+
+        float *out = src + i * QK_K;
+        int is = 0;
+
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t scale0, min0, scale1, min1;
+            get_scale_min_k4(is + 0, sc, &scale0, &min0);
+            get_scale_min_k4(is + 1, sc, &scale1, &min1);
+
+            float d1 = d * scale0, m1 = dmin * min0;
+            float d2 = d * scale1, m2 = dmin * min1;
+
+            for (int l = 0; l < 32; l++) out[l]      = d1 * (q[l] & 0x0F) - m1;
+            for (int l = 0; l < 32; l++) out[l + 32] = d2 * (q[l] >> 4)   - m2;
+
+            out += 64;
+            q   += 32;
+            is  += 2;
+        }
+    }
+}
+

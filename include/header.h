@@ -192,5 +192,7 @@ typedef struct {
 
 gguf_header_t *read_header(Arena *arena, const char *file_name);
 gguf_tensor_info_t *tensor_lookup(gguf_header_t *h, const char *name);
+gguf_metadata_kv_t *metadata_lookup(gguf_header_t *h, const char *name);
+
 
 #endif

@@ -52,6 +52,30 @@ void arena_free(Arena *a) {
     a->head = NULL;
 }
 
+void arena_pop(Arena *a, void *ptr, size_t size) {
+    if (!a || !ptr) return;
+
+    size = (size + 7) & ~(size_t)7;
+
+    if (a->head && ptr == (void *)(a->head->data + a->head->used - size)) {
+        a->head->used -= size;
+
+        if (a->head->used == 0 && a->head->next) {
+            ArenaBlock *old_head = a->head;
+            a->head = old_head->next;
+            free(old_head);
+        }
+        return;
+    }
+
+    if (a->head && a->head->next && ptr == (void *)a->head->next->data) {
+        ArenaBlock *large_block = a->head->next;
+        a->head->next = large_block->next;
+        free(large_block);
+        return;
+    }
+}
+
 void arena_print_usage(Arena *a) {
     size_t total_used = 0;
     size_t total_cap = 0;
