@@ -9,8 +9,6 @@
 #include "../include/rope.h"
 #include "../include/matrix_ops.h"
 
-float *load_matrix(gguf_tensor_info_t *mat, FILE *fp, long start_offset);
-
 float *embedding_forward(
     FILE *fp,
     gguf_tensor_info_t *tensor,
@@ -24,7 +22,11 @@ float *embedding_forward(
         return NULL;
     }
 
-    m->d_model = tensor->dimensions[0];
+    if (m->d_model != tensor->dimensions[0]){
+        fprintf(stderr, "Error, embed shape should be d_model * vocab_size\n");
+        return NULL;  
+    };
+
     const size_t vocab_size = tensor->dimensions[1];
 
     if (m->d_model % QK_K != 0) {
@@ -51,9 +53,7 @@ float *embedding_forward(
 
         float *dst = &out[i * m->d_model];
 
-        for (size_t k = 0; k < m->d_model; k++) {
-            dst[k] = W[k * vocab_size + tok];
-        }
+        memcpy(dst, W + tok * m->d_model, m->d_model * sizeof(float));
     }
 
     free(W);
@@ -84,8 +84,8 @@ float *load_matrix(gguf_tensor_info_t *mat, FILE *fp, long start_offset)
         return NULL;
     }
 
-    long pos = start_offset + mat->offset;
-    if (fseek(fp, pos, SEEK_SET)){
+    off_t pos = (off_t)start_offset + (off_t)mat->offset;
+    if (fseeko(fp, pos, SEEK_SET)){
         fprintf(stderr, "fseek error in load_matrix for %s", mat->name.string);
         return NULL;
     }
@@ -135,10 +135,11 @@ float *load_matrix(gguf_tensor_info_t *mat, FILE *fp, long start_offset)
             printf("Error, Not supported format for %s\n", mat->name.string);
             return NULL;
     }
+
     return res;
 }
 
-static void pack_head(float * restrict dst, const float * restrict X, size_t seq_len, size_t d_model,
+void pack_head(float * restrict dst, const float * restrict X, size_t seq_len, size_t d_model,
                  size_t head_dim, size_t head_idx)
 {
     for (size_t t = 0; t < seq_len; t++) {
@@ -153,18 +154,17 @@ static void pack_head(float * restrict dst, const float * restrict X, size_t seq
 
 static int projection(FILE *f, Model *m, long start_offset, float *restrict out, 
         const float *restrict x, gguf_tensor_info_t *W, gguf_tensor_info_t *b,
-        size_t row_mat, size_t col_mat
+        size_t out_dim
 ){
     float *mat = load_matrix(W, f, start_offset);
     if (!mat) {return 0;}
     float *bias = load_matrix(b, f, start_offset);
-    if (!bias) {free(mat); return 0;}
-    int ok = mat_mult(out, x, mat, bias, m->seq_len, m->d_model , row_mat, col_mat);
+    int ok = mat_mult_bt(out, x, mat, bias, m->seq_len, m->d_model , out_dim);
     free(mat); free(bias);
     return ok;
 }
 
-int attention_forward(FILE *f, Model *m, long start_offset,
+int attention_forward(FILE *f, Model *m, long start_offset, size_t layer,
             gguf_tensor_info_t *K_w,
             gguf_tensor_info_t *V_w,
             gguf_tensor_info_t *Q_w,
@@ -173,7 +173,7 @@ int attention_forward(FILE *f, Model *m, long start_offset,
             gguf_tensor_info_t *Q_b,
             gguf_tensor_info_t *Wo,
             gguf_tensor_info_t *Wo_b,
-            float *x, float *out, RopeTable rt)
+            float *x, size_t pos, float *out, RopeTable rt)
 {
 
     if (m->head_count == 0 || m->head_count_kv == 0) {
@@ -194,6 +194,9 @@ int attention_forward(FILE *f, Model *m, long start_offset,
     uint32_t head_dim   = m->d_model / m->head_count;
     uint32_t group_size = m->head_count / m->head_count_kv;
     uint32_t kv_width   = m->head_count_kv * head_dim;
+
+    size_t q_len  = m->seq_len;
+    size_t kv_len = pos + q_len;
     
     Arena arena = {0};
     size_t buf_Q_size = m->seq_len * m->d_model;
@@ -205,20 +208,23 @@ int attention_forward(FILE *f, Model *m, long start_offset,
     float *K_x = Q_x + buf_Q_size;
     float *V_x = K_x + buf_KV_size;
 
-    if (!projection(f, m, start_offset, Q_x, x, Q_w, Q_b, m->d_model, m->d_model)) {arena_free(&arena); return 0;}
-    if (!projection(f, m, start_offset, K_x, x, K_w, K_b, m->d_model, kv_width)) {arena_free(&arena); return 0;}
-    if (!projection(f, m, start_offset, V_x, x, V_w, V_b, m->d_model, kv_width)) {arena_free(&arena); return 0;}
+    if (!projection(f, m, start_offset, Q_x, x, Q_w, Q_b, m->d_model)) {arena_free(&arena); return 0;}
+    if (!projection(f, m, start_offset, K_x, x, K_w, K_b, kv_width)) {arena_free(&arena); return 0;}
+    if (!projection(f, m, start_offset, V_x, x, V_w, V_b, kv_width)) {arena_free(&arena); return 0;}
 
-    apply_rope(Q_x, m->seq_len, m->head_count, head_dim, rt);
-    apply_rope(K_x, m->seq_len, m->head_count_kv, head_dim, rt);
+    apply_rope(Q_x, q_len, m->head_count,    head_dim, rt, pos);
+    apply_rope(K_x, q_len, m->head_count_kv, head_dim, rt, pos);
 
-    float inv_sqrt_head_dim = 1.f / sqrtf(head_dim);
-    for(size_t i = 0; i < m->seq_len * m->d_model ; i++) Q_x[i] *= inv_sqrt_head_dim;
+    memcpy(&m->K_cache[layer][kv_width * pos], K_x, m->seq_len * kv_width * sizeof(float));
+    memcpy(&m->V_cache[layer][kv_width * pos], V_x, m->seq_len * kv_width * sizeof(float));
 
     float *context = Q_x;
 
-    size_t buf_AB_size = m->seq_len * head_dim;
-    size_t buf_S_size  = m->seq_len * m->seq_len;
+    float inv_sqrt_head_dim = 1.f / sqrtf(head_dim);
+    for(size_t i = 0; i < q_len * m->d_model ; i++) Q_x[i] *= inv_sqrt_head_dim;
+
+    size_t buf_AB_size = kv_len * head_dim;
+    size_t buf_S_size  = q_len * kv_len;
     float *tmp = arena_alloc(&arena, (buf_AB_size * 2 + buf_S_size) * sizeof(float));
     if (!tmp) {arena_free(&arena); return 0;}
     float *head_buf1 = tmp; 
@@ -228,20 +234,20 @@ int attention_forward(FILE *f, Model *m, long start_offset,
     for (uint32_t q_head = 0; q_head < m->head_count; q_head++) {
         uint32_t kv_head = q_head / group_size;
         
-        pack_head(head_buf1, K_x, m->seq_len, kv_width, head_dim, kv_head);
-        transp(head_buf2, head_buf1, m->seq_len, head_dim);
+        pack_head(head_buf1, m->K_cache[layer], kv_len, kv_width, head_dim, kv_head);
+        transp(head_buf2, head_buf1, kv_len, head_dim);
 
-        pack_head(head_buf1, Q_x, m->seq_len, m->d_model, head_dim, q_head);
-        int err = mat_mult(score_buf, head_buf1, head_buf2, NULL, m->seq_len, head_dim, head_dim, m->seq_len);
+        pack_head(head_buf1, Q_x, q_len, m->d_model, head_dim, q_head);
+        int err = mat_mult(score_buf, head_buf1, head_buf2, NULL, q_len, head_dim, kv_len);
         if (!err) {arena_free(&arena); return 0;}
 
-        softmax_causal(score_buf, m->seq_len);
+        softmax_causal(score_buf, q_len, kv_len, pos);
 
-        pack_head(head_buf1, V_x, m->seq_len, kv_width, head_dim, kv_head);
-        err = mat_mult(head_buf2, score_buf, head_buf1, NULL, m->seq_len,  m->seq_len, m->seq_len, head_dim);
+        pack_head(head_buf1, m->V_cache[layer], kv_len, kv_width, head_dim, kv_head);
+        err = mat_mult(head_buf2, score_buf, head_buf1, NULL, q_len,  kv_len, head_dim);
         if (!err) {arena_free(&arena); return 0;}
 
-        for (size_t t = 0; t < m->seq_len; t++) {
+        for (size_t t = 0; t < q_len; t++) {
             memcpy(context + t * m->d_model + q_head * head_dim,
                 head_buf2 + t * head_dim,
                 head_dim * sizeof(float));
@@ -254,7 +260,7 @@ int attention_forward(FILE *f, Model *m, long start_offset,
     float *b_o = NULL;
     if (!W_o){ free(W_o); free(b_o); arena_free(&arena); return 0;}
 
-    int ok = mat_mult(out, context, W_o, b_o, m->seq_len, m->d_model, m->d_model, m->d_model);
+    int ok = mat_mult_bt(out, context, W_o, b_o, q_len, m->d_model, m->d_model);
     free(W_o); free(b_o); arena_free(&arena);
 
     return ok;
@@ -279,7 +285,7 @@ float *feed_forward(FILE *f, Model *m,long start_offset,
     float *gate = malloc(m->seq_len * dim_gate * sizeof(float));
     if (!gate) { free(W2); return NULL; }
 
-    int err = mat_mult(gate, x, W2, NULL, m->seq_len, m->d_model, m->d_model, dim_gate);
+    int err = mat_mult_bt(gate, x, W2, NULL, m->seq_len, m->d_model, dim_gate);
     free(W2);
     if (!err) { free(gate); return NULL; }
 
@@ -300,13 +306,19 @@ float *feed_forward(FILE *f, Model *m,long start_offset,
     float *up = malloc(m->seq_len * dim_up * sizeof(float));
     if (!up) { free(gate); free(W1); return NULL; }
 
-    err = mat_mult(up, x, W1, NULL, m->seq_len, m->d_model, m->d_model, dim_up);
+    err = mat_mult_bt(up, x, W1, NULL, m->seq_len, m->d_model, dim_up);
     free(W1);
     if (!err) { free(gate); free(up); return NULL; }
 
-    for (size_t i = 0; i < m->seq_len; i++)
-        for (size_t j = 0; j < dim_gate; j++)
-            gate[i * dim_gate + j] *= up[i * dim_gate + j] / (1.0f + expf(-gate[i * dim_gate + j]));
+    for (size_t i = 0; i < m->seq_len; i++) {
+        for (size_t j = 0; j < dim_gate; j++) {
+            float g = gate[i * dim_gate + j];
+            float u = up[i * dim_gate + j];
+            float silu = g / (1.0f + expf(-g));
+            float result = u * silu;
+            gate[i * dim_gate + j] = result;
+        }
+    }
 
     free(up);
 
@@ -321,8 +333,7 @@ float *feed_forward(FILE *f, Model *m,long start_offset,
 
     float *out = malloc(m->seq_len * m->d_model * sizeof(float));
     if (!out) { free(gate); free(W3); return NULL; }
-
-    err = mat_mult(out, gate, W3, NULL, m->seq_len, dim_gate, dim_down, m->d_model);
+    err = mat_mult_bt(out, gate, W3, NULL, m->seq_len, dim_gate, m->d_model);
     free(W3); free(gate);
     if (!err) { free(out); return NULL; }
 
@@ -341,16 +352,11 @@ gguf_tensor_info_t * get_tensor(gguf_header_t *header, const char *fmt, size_t i
     return target;
 }
 
-float *transformer(Arena *arena, FILE *f, gguf_header_t *header, uint32_t *tokens, Model *m, RopeTable rt, size_t vocab_size)
+float *transformer(Arena *arena, FILE *f, gguf_header_t *header, uint32_t *tokens, Model *m, RopeTable rt, size_t vocab_size, size_t pos)
 {
-    gguf_metadata_kv_t *head_count_kv_m = metadata_lookup(header, "qwen2.attention.head_count_kv");
     gguf_metadata_kv_t *eps = metadata_lookup(header, "qwen2.attention.layer_norm_rms_epsilon");
-    gguf_metadata_kv_t *block_count = metadata_lookup(header, "qwen2.block_count");
-    if (!head_count_kv_m || head_count_kv_m->value_type != GGUF_METADATA_VALUE_TYPE_UINT32  ||
-        !eps || eps->value_type != GGUF_METADATA_VALUE_TYPE_FLOAT32 ||
-        !block_count || block_count->value_type != GGUF_METADATA_VALUE_TYPE_UINT32) return 0;
+    if( !eps || eps->value_type != GGUF_METADATA_VALUE_TYPE_FLOAT32 ) return 0;
 
-    m->head_count_kv = head_count_kv_m->value.uint32;
     float epsilon = eps->value.float32;
 
     gguf_tensor_info_t *embed_tensor = tensor_lookup(header,"token_embd.weight");
@@ -364,13 +370,12 @@ float *transformer(Arena *arena, FILE *f, gguf_header_t *header, uint32_t *token
     float *tmp = arena_alloc(arena, 2 * size * sizeof(float));
     float *residual = tmp + size;
     if (!tmp) return NULL;
-    
-
+ 
     gguf_tensor_info_t *K_w, *V_w, *Q_w, *K_b, *V_b, *Q_b, *Wo, *Wo_b, *norm_weight, *norm_weight_ffn, *W_up, *W_gate, *W_down;
-    for(size_t i = 0; i < block_count->value.uint32; i++){
+    for(size_t i = 0; i < m->block_count; i++){
         if (!(norm_weight = get_tensor(header, "blk.%zu.attn_norm.weight", i))) {free(tmp); return NULL;};
         float *g = load_matrix(norm_weight, f, header->tensor_data_offset);
-        memcpy(residual, x, size);
+        memcpy(residual, x, size * sizeof(float));
         RMSNorm(m, x, g, epsilon);
         free(g);
 
@@ -378,29 +383,30 @@ float *transformer(Arena *arena, FILE *f, gguf_header_t *header, uint32_t *token
         if (!(V_w = get_tensor(header, "blk.%zu.attn_v.weight", i))) return NULL;
         if (!(Q_w = get_tensor(header, "blk.%zu.attn_q.weight", i))) return NULL;
 
-        if (!(K_b = get_tensor(header, "blk.%zu.attn_k.bias", i))) return NULL;
-        if (!(V_b = get_tensor(header, "blk.%zu.attn_v.bias", i))) return NULL;
-        if (!(Q_b = get_tensor(header, "blk.%zu.attn_q.bias", i))) return NULL;
+
+        K_b = get_tensor(header, "blk.%zu.attn_k.bias", i);
+        V_b = get_tensor(header, "blk.%zu.attn_v.bias", i);
+        Q_b = get_tensor(header, "blk.%zu.attn_q.bias", i);
 
         if (!(Wo = get_tensor(header, "blk.%zu.attn_output.weight", i))) return NULL;
         //if (!get_tensor(Wo_b, header, "blk.%zu.attn_output.bias", i))  return NULL;
         Wo_b = NULL;
 
-        int err = attention_forward(f, m, header->tensor_data_offset, K_w, V_w, Q_w,
+        int err = attention_forward(f, m, header->tensor_data_offset, i, K_w, V_w, Q_w,
             K_b, V_b, Q_b, Wo, Wo_b,
-            x, tmp, rt);
+            x, pos, tmp, rt);
         
         if (!err) return NULL;
 
         for(size_t j = 0; j < m->seq_len * m->d_model; j++)
             x[j] = residual[j] + tmp[j];
-        memcpy(residual, x, size);
+        memcpy(residual, x, size * sizeof(float));
 
         if (!(norm_weight_ffn = get_tensor(header, "blk.%zu.ffn_norm.weight", i))) return NULL;
         float *g2 = load_matrix(norm_weight_ffn, f, header->tensor_data_offset);
         if (!g2) return NULL;
         RMSNorm(m, x, g2, epsilon);
-        free(g2);
+        free(g2);   
 
         if (!(W_up = get_tensor(header, "blk.%zu.ffn_up.weight", i))) return NULL;
         if (!(W_gate = get_tensor(header, "blk.%zu.ffn_gate.weight", i))) return NULL;
@@ -408,14 +414,13 @@ float *transformer(Arena *arena, FILE *f, gguf_header_t *header, uint32_t *token
 
         float *ffn = feed_forward(f, m, header->tensor_data_offset, W_up, W_gate, W_down, x);
         if (!ffn) return NULL;
-
         for(size_t j = 0; j < m->seq_len * m->d_model; j++)
             x[j] = residual[j] + ffn[j];
 
         free(ffn);
 
     }
-    arena_pop(arena, tmp, size);
+    arena_pop(arena, tmp, 2 * size);
 
     gguf_tensor_info_t *output_norm = tensor_lookup(header, "output_norm.weight");
     if (!output_norm) { fprintf(stderr, "Error: output_norm.weight not found\n"); return NULL; }
@@ -432,7 +437,7 @@ float *transformer(Arena *arena, FILE *f, gguf_header_t *header, uint32_t *token
     for (size_t j = 0; j < vocab_size; j++) {
         float sum = 0.f;
         for (size_t k = 0; k < m->d_model; k++) {
-            sum += last[k] * w_out[k * vocab_size + j];
+            sum += last[k] * w_out[j * m->d_model + k];
         }
         out[j] = sum;
     }

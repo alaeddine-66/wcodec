@@ -3,9 +3,10 @@
 #include "../include/tokenizer.h"
 #include "../include/hashmap.h"
 #include "../include/model.h"
+#include "../include/rope.h"
 #include <stdlib.h>
 
-#define MAX_NEW_TOKENS 20
+#define MAX_NEW_TOKENS 250
 
 static size_t argmax(const float *arr, size_t n)
 {
@@ -36,12 +37,17 @@ int encode(char *file_name)
         arena_free(&arena);
         return 0;
     }
-    //tokenizer_dump(&t);
 
     uint32_t *tokens = NULL;
     size_t n = 0;
 
-    if (!tokenizer_encode(&t, "hello world", &tokens, &n, 1)) {
+    if (!tokenizer_encode(&t,
+        "<|im_start|>system\n"
+        "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "who are you ?<|im_end|>\n"
+        "<|im_start|>assistant\n",
+        &tokens, &n, 0)){
         fprintf(stderr, "encode failed\n");
         arena_free(&arena);
         return 0;
@@ -84,10 +90,14 @@ int encode(char *file_name)
     gguf_metadata_kv_t *rope_theta_m = metadata_lookup(header, "qwen2.rope.freq_base");
     gguf_metadata_kv_t *embedding_length = metadata_lookup(header, "qwen2.embedding_length");
     gguf_metadata_kv_t *head_count_m = metadata_lookup(header, "qwen2.attention.head_count");
+    gguf_metadata_kv_t *head_count_kv_m = metadata_lookup(header, "qwen2.attention.head_count_kv");
+    gguf_metadata_kv_t *block_count = metadata_lookup(header, "qwen2.block_count");
     if (
         !head_count_m || head_count_m->value_type != GGUF_METADATA_VALUE_TYPE_UINT32 ||
         !rope_theta_m || rope_theta_m->value_type != GGUF_METADATA_VALUE_TYPE_FLOAT32 ||
-        !embedding_length || embedding_length->value_type != GGUF_METADATA_VALUE_TYPE_UINT32
+        !embedding_length || embedding_length->value_type != GGUF_METADATA_VALUE_TYPE_UINT32 ||
+        !head_count_kv_m || head_count_kv_m->value_type != GGUF_METADATA_VALUE_TYPE_UINT32 ||
+        !block_count || block_count->value_type != GGUF_METADATA_VALUE_TYPE_UINT32
     ){  fprintf(stderr, "metadata not found\n");
         fclose(f);
         free(tokens);
@@ -98,15 +108,40 @@ int encode(char *file_name)
     Model m = {0};
     m.d_model = embedding_length->value.uint32;
     m.head_count = head_count_m->value.uint32;
+    m.head_count_kv = head_count_kv_m->value.uint32;
+    m.block_count = block_count->value.uint32;
     uint32_t head_dim = m.d_model / m.head_count;
+    uint32_t kv_width = m.head_count_kv * head_dim;
     float rope_theta= rope_theta_m->value.float32;
     RopeTable rt = build_rope_table(&arena, cap, head_dim, rope_theta);
 
-    for (size_t step = 0; step < MAX_NEW_TOKENS; step++) {
-        m.seq_len = n;
-        printf("step %zu\n", step);
+    m.seq_len = n;
+    /* allocation des pointeurs de couches */
+    m.K_cache = arena_alloc(&arena, m.block_count * sizeof(float *));
+    m.V_cache = arena_alloc(&arena, m.block_count * sizeof(float *));
 
-        float *out = transformer(&arena, f, header, tokens, &m, rt, vocab_size);
+    if (!m.K_cache || !m.V_cache) {
+        fprintf(stderr, "K/V cache pointer allocation failed\n");
+        fclose(f); free(tokens); arena_free(&arena);
+        return 0;
+    }
+
+    /* allocation de chaque couche */
+    for (size_t l = 0; l < m.block_count; l++) {
+
+        m.K_cache[l] = arena_alloc(&arena, cap * kv_width * sizeof(float));
+        m.V_cache[l] = arena_alloc(&arena, cap * kv_width * sizeof(float));
+
+        if (!m.K_cache[l] || !m.V_cache[l]) {
+            fprintf(stderr, "KV cache allocation failed at layer %zu\n", l);
+            fclose(f); free(tokens); arena_free(&arena);
+            return 0;
+        }
+    }
+    size_t pos = 0;
+    for (size_t step = 0; step < MAX_NEW_TOKENS; step++) {
+
+        float *out = transformer(&arena, f, header, &tokens[pos], &m, rt, vocab_size, pos);
         if (!out) {
             fprintf(stderr, "transformer failed at step %zu\n", step);
             break;
@@ -117,7 +152,7 @@ int encode(char *file_name)
 
         char *decoded = NULL;
         if (tokenizer_decode(&t, &arena, &next_id, 1, &decoded)) {
-            printf("[%zu] id=%u  \"%s\"\n", step, next_id, decoded);
+            printf("%s", decoded);
             free(decoded);
         } else {
             printf("[%zu] id=%u  (decode failed)\n", step, next_id);
@@ -127,8 +162,10 @@ int encode(char *file_name)
             printf("\n(EOS reached)\n");
             break;
         }
-
-        tokens[n++] = next_id;
+        tokens[n] = next_id;  
+        pos = n;              
+        n++;                 
+        m.seq_len = 1;       
     }
 
     printf("\nfull sequence: ");
@@ -144,6 +181,5 @@ int encode(char *file_name)
     arena_free(&arena);
 
     printf("EXIT SUCCESS\n");
-    printf("%zu\n", sizeof(size_t));
     return 1;
 }

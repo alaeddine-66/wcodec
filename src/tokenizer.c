@@ -214,7 +214,24 @@ int tokenizer_init(Tokenizer *t, Arena *arena, const gguf_header_t *header, cons
     fclose(f);
 
     if (t->special_count > 1) {
-        qsort(t->special_tokens, t->special_count, sizeof(t->special_tokens[0]), special_cmp_desc_len);
+        //qsort(t->special_tokens, t->special_count, sizeof(t->special_tokens[0]), special_cmp_desc_len);
+        for (size_t i = 0; i < t->special_count - 1; i++) {
+            size_t max_idx = i;
+            for (size_t j = i + 1; j < t->special_count; j++) {
+                if (special_cmp_desc_len(&t->special_tokens[j], &t->special_tokens[max_idx]) < 0) {
+                    max_idx = j;
+                }
+            }
+            if (max_idx != i) {
+                const char *tmp_tok = t->special_tokens[i];
+                t->special_tokens[i] = t->special_tokens[max_idx];
+                t->special_tokens[max_idx] = tmp_tok;
+
+                uint32_t tmp_id = t->special_ids[i];
+                t->special_ids[i] = t->special_ids[max_idx];
+                t->special_ids[max_idx] = tmp_id;
+            }
+        }
     }
 
     return 1;

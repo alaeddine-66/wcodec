@@ -10,6 +10,6 @@ typedef struct {
 } RopeTable;
 
 RopeTable build_rope_table(Arena *arena, size_t seq_len, size_t head_dim, float rope_theta);
-void apply_rope(float *X,size_t seq_len, size_t n_heads, size_t head_dim, RopeTable rt);
+void apply_rope(float *X,size_t seq_len, size_t n_heads, size_t head_dim, RopeTable rt, size_t pos);
 
 #endif

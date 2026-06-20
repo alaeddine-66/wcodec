@@ -60,18 +60,20 @@ void apply_rope( float *X,
     size_t seq_len,
     size_t n_heads,
     size_t head_dim,
-    RopeTable rt
+    RopeTable rt,
+    size_t start_pos
 ){
     size_t dim = n_heads * head_dim;
     size_t n_pairs = head_dim / 2;
 
     for (size_t t = 0; t < seq_len; t++) {
         float *xt = X + t * dim;
+        size_t abs_pos = start_pos + t;
         for (size_t h = 0; h < n_heads; h++) {
             float *xh = xt + h * head_dim;
             for (size_t i = 0; i < n_pairs; i++) {
 
-                size_t idx = t * n_pairs + i;
+                size_t idx = abs_pos * n_pairs + i;
 
                 float c = rt.cos[idx];
                 float s = rt.sin[idx];
